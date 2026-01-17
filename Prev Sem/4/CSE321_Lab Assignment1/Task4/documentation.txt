@@ -1,0 +1,3 @@
+We created sort.c to sort the numbers given in command line arguments.
+We created oddeven.c to get odd-even status of the numbers given in command line arguments.
+Then finally we created parentchild program to first create child a thru fork sort then parent gets the odd even status through execv().

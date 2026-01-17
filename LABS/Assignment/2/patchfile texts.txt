@@ -1,0 +1,333 @@
+diff --git a/Makefile b/Makefile
+index b262c0a..e3b1392 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_test_scheduler\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -166,7 +167,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..9c92780 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -101,6 +101,9 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++// My code
++int             rand(void);
++int             settickets(int);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22a5401..73e62a9 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -6,6 +6,27 @@
+ #include "proc.h"
+ #include "defs.h"
+ 
++// My code
++unsigned long rand_next = 1;
++
++int do_rand(unsigned long *ctx) {
++  long hi, lo, x;
++  x = (*ctx % 0x7ffffffe) + 1;
++  hi = x / 127773;
++  lo = x % 127773;
++  x = 16807 * lo - 2836 * hi;
++  if (x < 0)
++    x += 0x7fffffff;
++  x--;
++  *ctx = x;
++  return x;
++}
++
++int rand(void) {
++  return do_rand(&rand_next);
++}
++
++
+ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+@@ -125,6 +146,10 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  // My code
++  p->tickets = 0;
++  p->rounds = 0;
++
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+     freeproc(p);
+@@ -168,6 +193,12 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++
++  //My code
++  p->tickets = 0;
++  p->rounds = 0;
++
++
+   p->state = UNUSED;
+ }
+ 
+@@ -226,6 +257,10 @@ userinit(void)
+   
+   p->cwd = namei("/");
+ 
++  // My code
++  p->tickets = 10;
++  p->rounds = 0;
++
+   p->state = RUNNABLE;
+ 
+   release(&p->lock);
+@@ -299,6 +334,11 @@ kfork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
++
++  // My code
++  np->tickets = p->tickets;
++  np->rounds = 0;
++
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
+@@ -437,27 +477,69 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
+-    int found = 0;
++    //int found = 0;
++    // for(p = proc; p < &proc[NPROC]; p++) {
++    //   acquire(&p->lock);
++    //   if(p->state == RUNNABLE) {
++    //     // Switch to chosen process.  It is the process's job
++    //     // to release its lock and then reacquire it
++    //     // before jumping back to us.
++    //     p->state = RUNNING;
++    //     c->proc = p;
++    //     swtch(&c->context, &p->context);
++
++    //     // Process is done running for now.
++    //     // It should have changed its p->state before coming back.
++    //     c->proc = 0;
++    //     found = 1;
++    //   }
++    //   release(&p->lock);
++    // }
++    // if(found == 0) {
++    //   // nothing to run; stop running on this core until an interrupt.
++    //   asm volatile("wfi");
++    
++    // My code
++    int total_tickets = 0;
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
++        total_tickets += p->tickets;
+       }
+       release(&p->lock);
+     }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
++
++    if(total_tickets == 0) {
+       asm volatile("wfi");
++      continue;
++    }
++
++    int winning = rand() % total_tickets;
++    int current = 0;
++    struct proc *winner = 0;
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        if(winning < current + p->tickets && winner == 0) {
++          winner = p;
++        }
++        current += p->tickets;
++      }
++      release(&p->lock);
++    }
++
++    if(winner != 0) {
++      acquire(&winner->lock);
++      if(winner->state == RUNNABLE) {
++        winner->state = RUNNING;
++        c->proc = winner;
++        swtch(&c->context, &winner->context);
++        c->proc = 0;
++        winner->rounds++;
++      }
++      release(&winner->lock);
++
+     }
+   }
+ }
+@@ -684,7 +766,11 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
++    //printf("%d %s %s", p->pid, state, p->name);
++    
++    // My code
++    printf("%d %s %s tickets=%d rounds=%d\n", p->pid, state, p->name, p->tickets, p->rounds);
++    
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..19ef9b9 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -84,6 +84,10 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
++  
++  // My code
++  int tickets;
++  int rounds;
+ 
+   // p->lock must be held when using these:
+   enum procstate state;        // Process state
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..f6aee48 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++// My code
++extern uint64 sys_settickets(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets] sys_settickets,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..f085330 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_settickets 22
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 419e727..f463347 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,8 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "vm.h"
++// My code
++#include "syscall.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -107,3 +109,15 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// My code
++uint64
++sys_settickets(void)
++{
++  int n;
++  argint(0, &n);
++  if(n <= 0)
++    return -1;
++  myproc()->tickets = n;
++  return 0;
++}
+diff --git a/user/test_scheduler.c b/user/test_scheduler.c
+new file mode 100644
+index 0000000..0afe425
+--- /dev/null
++++ b/user/test_scheduler.c
+@@ -0,0 +1,17 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++// My file
++
++int
++main(int argc, char *argv[])
++{
++  if(argc != 2)
++    exit(1);
++
++  int t = atoi(argv[1]);
++  settickets(t);
++
++  while(1);
++}
+diff --git a/user/user.h b/user/user.h
+index ac84de9..84a4139 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,8 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++// My code
++int settickets(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..6dd65c2 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++
++entry("settickets");
+\ No newline at end of file
